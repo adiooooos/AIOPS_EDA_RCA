@@ -1,0 +1,218 @@
+# Linux 文件系统空间不足故障诊断与修复
+# 基于 Prometheus Linux Filesystem Alerts 告警的自动化响应
+# 功能：
+# 1. 收集指定挂载点的空间使用情况
+# 2. 分析inode使用情况
+# 3. 检查相关进程、打开文件、目录占用
+# 4. 收集系统日志 (限制为 100 行)
+# 5. 生成并传输诊断报告至 Diagnose Server
+
+---
+- name: "Filesystem Diagnosis and Transfer to Diagnose Server"
+  hosts: rhel9
+  become: true
+  vars:
+    mountpoint: "{{ event.payload.alerts[0].labels.mountpoint | default('/') }}"  # 从告警中获取挂载点，默认为根目录
+    output_base: "/TS"                                                           # 本地输出目录基础路径
+    diagnose_server: "10.66.208.232"                                             # 诊断服务器IP地址（可用 inventory 名称或 IP）
+    timestamp_suffix: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"  # 时间戳后缀
+    output_dir: "{{ output_base }}/{{ inventory_hostname }}-{{ timestamp_suffix }}"  # 本地输出目录
+    diagnose_path: "/diagnose/{{ inventory_hostname }}-{{ timestamp_suffix }}"       # 诊断服务器目标路径
+    max_journal_lines: 100                                                       # 日志收集行数限制
+    report_name: "{{ inventory_hostname }}-filesystem-diagnostic.txt"            # 诊断报告文件名
+
+  tasks:
+    # 1. 环境准备
+    - name: "Ensure local output directory exists"
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "Record metadata facts"
+      ansible.builtin.set_fact:
+        diag_meta:
+          host: "{{ ansible_fqdn | default(inventory_hostname) }}"
+          mount: "{{ mountpoint }}"
+          run_at: "{{ ansible_date_time.iso8601 }}"
+
+    # 2. 基本空间和 inode 检查
+    - name: "Collect df usage for mountpoint"
+      ansible.builtin.command: "df -hT {{ mountpoint }}"
+      register: fs_df
+      changed_when: false
+      failed_when: false
+
+    - name: "Collect inode usage for mountpoint"
+      ansible.builtin.command: "df -i {{ mountpoint }}"
+      register: fs_inode
+      changed_when: false
+      failed_when: false
+
+    # 3. 大文件/目录分析
+    - name: "Find top 10 largest files under mountpoint"
+      ansible.builtin.shell: "find {{ mountpoint }} -xdev -type f -printf '%s %p\\n' 2>/dev/null | sort -nr | head -10"
+      register: top_files
+      changed_when: false
+      failed_when: false
+
+    - name: "Find top 10 largest directories under mountpoint"
+      ansible.builtin.shell: "du -sh {{ mountpoint }}/* 2>/dev/null | sort -hr | head -10"
+      register: top_dirs
+      changed_when: false
+      failed_when: false
+
+    # 4. 打开文件检查
+    - name: "Check open files under mountpoint"
+      ansible.builtin.shell: "lsof +D {{ mountpoint }} 2>/dev/null | head -50"
+      register: open_files
+      changed_when: false
+      failed_when: false
+
+    # 5. 日志收集
+    - name: "Collect recent system logs (last {{ max_journal_lines }} lines)"
+      ansible.builtin.command:
+        cmd: "journalctl --since '1 hour ago' -n {{ max_journal_lines }} --no-pager"
+      register: journal_recent
+      changed_when: false
+      failed_when: false
+
+    # 6. 生成本地诊断报告
+    - name: "Compose local diagnostic report"
+      ansible.builtin.copy:
+        dest: "{{ output_dir }}/{{ report_name }}"
+        content: |
+          ==== FILESYSTEM DIAGNOSTIC REPORT ====
+          Host: {{ diag_meta.host }}
+          Mountpoint: {{ diag_meta.mount }}
+          Run At: {{ diag_meta.run_at }}
+
+          ---- df usage ----
+          {{ fs_df.stdout | default('N/A') }}
+
+          ---- inode usage ----
+          {{ fs_inode.stdout | default('N/A') }}
+
+          ---- Top 10 largest files ----
+          {{ top_files.stdout | default('N/A') }}
+
+          ---- Top 10 largest directories ----
+          {{ top_dirs.stdout | default('N/A') }}
+
+          ---- Open files (top 50) ----
+          {{ open_files.stdout | default('N/A') }}
+
+          ---- Recent system logs (last {{ max_journal_lines }} lines) ----
+          {{ journal_recent.stdout | default('') }}
+
+          ==== END OF REPORT ====
+        mode: "0644"
+
+    # 7. 准备诊断服务器连接
+    - name: "Ensure diagnose server host key is in known_hosts"
+      ansible.builtin.known_hosts:
+        name: "{{ diagnose_server }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -T 5 -H ' ~ diagnose_server) }}"
+        path: "/root/.ssh/known_hosts"
+
+    # 8. 传输本地诊断目录到 Diagnose Server
+    - name: "Verify local output directory exists before transfer"
+      ansible.builtin.stat:
+        path: "{{ output_dir }}"
+      register: source_dir_check
+
+    - name: "Transfer collected files to Diagnose Server"
+      ansible.posix.synchronize:
+        src: "{{ output_dir }}/"
+        dest: "root@{{ diagnose_server }}:{{ diagnose_path }}/"
+        recursive: yes
+        mode: push
+      delegate_to: "{{ inventory_hostname }}"
+      when: source_dir_check.stat.exists and source_dir_check.stat.isdir
+
+    # 9. 查找并传输 EDA 生成的 alert 文件（改进：匹配三类可能文件）
+    - name: "Find possible filesystem alert files for this host in /tmp"
+      ansible.builtin.find:
+        paths: "/tmp"
+        patterns:
+          - "{{ inventory_hostname }}-*-filesystem_alert.txt"
+          - "{{ inventory_hostname }}-*-critical_filesystem_alert.txt"
+          - "{{ inventory_hostname }}-*-predictive_filesystem_alert.txt"
+        recurse: false
+      register: alert_files
+
+    - name: "Debug - alert files found"
+      ansible.builtin.debug:
+        msg: "Found alert files: {{ alert_files.files | map(attribute='path') | list }}"
+      when: alert_files is defined
+
+    - name: "Set latest_alert_raw fact (empty dict when none found)"
+      ansible.builtin.set_fact:
+        latest_alert_raw: "{{ (alert_files.files | sort(attribute='mtime') | last) | default({}) }}"
+
+    - name: "Set alert_file_name and alert_file_src_path facts (safe defaults)"
+      ansible.builtin.set_fact:
+        alert_file_name: >-
+          {{ (latest_alert_raw.path | basename) if (latest_alert_raw is defined and latest_alert_raw.path is defined) else '' }}
+        alert_file_src_path: >-
+          {{ (latest_alert_raw.path) if (latest_alert_raw is defined and latest_alert_raw.path is defined) else '' }}
+
+    - name: "Debug - selected alert file"
+      ansible.builtin.debug:
+        msg:
+          - "alert_file_name: {{ alert_file_name | default('') }}"
+          - "alert_file_src_path: {{ alert_file_src_path | default('') }}"
+
+    - name: "Transfer latest alert file to Diagnose Server (if exists)"
+      ansible.posix.synchronize:
+        src: "{{ alert_file_src_path }}"
+        dest: "root@{{ diagnose_server }}:{{ diagnose_path }}/"
+        mode: push
+      delegate_to: "{{ inventory_hostname }}"
+      when: alert_file_src_path != ''
+
+    # 10. 在 Diagnose Server 上合并为 issues_latest.txt（使用 hostvars[inventory_hostname].alert_file_name 安全取值）
+    - name: "Merge all files into issues_latest.txt on Diagnose Server"
+      ansible.builtin.shell: |
+        cd {{ diagnose_path }}
+        ALERT_FILE="{{ hostvars[inventory_hostname].alert_file_name | default('') }}"
+
+        if [ -n "$ALERT_FILE" ] && [ -f "$ALERT_FILE" ]; then
+          echo "=== ALERT INFO (${ALERT_FILE}) ===" > issues_latest.txt
+          cat "$ALERT_FILE" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+          echo "=== OTHER DIAGNOSTIC FILES ===" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+        else
+          echo "=== DIAGNOSTIC FILES ===" > issues_latest.txt
+          echo "" >> issues_latest.txt
+        fi
+
+        find . -maxdepth 1 -type f \( -name "*.txt" -o -name "*.log" -o -name "*.data" \) \
+          ! -name "issues_latest.txt" ! -name "$ALERT_FILE" -print0 |
+        while IFS= read -r -d '' file; do
+          echo "=== ${file#./} ===" >> issues_latest.txt
+          cat "$file" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+          echo "" >> issues_latest.txt
+        done
+
+        echo "Merged: $(ls -1 | grep -E 'issues_latest.txt|{{ report_name }}|.*alert.*' || true)"
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ diagnose_server }}"
+
+    - name: "Verify merged issues_latest.txt exists on Diagnose Server"
+      ansible.builtin.stat:
+        path: "{{ diagnose_path }}/issues_latest.txt"
+      delegate_to: "{{ diagnose_server }}"
+      register: merged_file_stat
+
+    - name: "Final debug - report location"
+      ansible.builtin.debug:
+        msg: |
+          Diagnostic bundle for filesystem transferred to Diagnose Server:
+          - Diagnose server: {{ diagnose_server }}
+          - Diagnose directory: {{ diagnose_path }}
+          - issues_latest.txt exists: {{ merged_file_stat.stat.exists | default(false) }}
+
