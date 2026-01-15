@@ -1,0 +1,387 @@
+# Linux sshd 服务故障诊断与修复
+# 基于 Prometheus SystemdServiceDown 告警的自动化响应
+# 监控服务：只监控以下服务，如果遇到服务inactive等故障症状，则对相应的服务进行诊断。服务为sshd.service
+# 功能：
+# 1. 进行sshd服务状态诊断
+# 2. 进行sshd服务日志分析
+# 3. sshd服务配置文件及语法检查；
+# 4. sshd服务依赖检查
+# 5. 生成sshd诊断报告
+
+---
+- name: "sshd Service Diagnosis and Transfer to Diagnose Server"
+  hosts: rhel9
+  become: true
+  vars:
+    service_name: "sshd.service"
+    output_base: "/TS"
+    diagnose_server: "10.66.208.232"           # 诊断服务器 IP 或主机名，请按需修改
+    # 诊断目录：/diagnose/<host>-YYYY-MM-dd-hh-mm
+    timestamp_suffix: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
+    output_dir: "{{ output_base }}/{{ inventory_hostname }}-{{ timestamp_suffix }}"
+    diagnose_path: "/diagnose/{{ inventory_hostname }}-{{ timestamp_suffix }}"
+    journal_since: "1 hour ago"
+    max_journal_lines: 1000
+    report_name: "{{ inventory_hostname }}-{{ service_name | replace('.','-') }}-diagnostic.txt"
+    alert_file_pattern: "{{ inventory_hostname }}-*-alert_info.txt"
+  tags:
+    - sshd_diagnose
+
+  tasks:
+
+  - name: "Ensure local output directory exists"
+    ansible.builtin.file:
+      path: "{{ output_dir }}"
+      state: directory
+      mode: "0755"
+    tags: sshd_diagnose
+
+  - name: "Record metadata facts"
+    ansible.builtin.set_fact:
+      diag_meta:
+        host: "{{ ansible_fqdn | default(inventory_hostname) }}"
+        service: "{{ service_name }}"
+        run_at: "{{ ansible_date_time.iso8601 }}"
+    tags: sshd_diagnose
+
+  # 1. 检查 sshd 服务状态
+  - name: "Get sshd ActiveState"
+    ansible.builtin.command:
+      cmd: "systemctl show -p ActiveState --value {{ service_name }}"
+    register: svc_active_raw
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  - name: "Get full systemctl status for sshd (no pager)"
+    ansible.builtin.command:
+      cmd: "systemctl status --no-pager -l {{ service_name }}"
+    register: svc_status
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  # 2. 收集 sshd 服务日志（journalctl）
+  - name: "Collect recent journalctl logs for sshd"
+    ansible.builtin.command:
+      cmd: "journalctl -u {{ service_name }} --since '{{ journal_since }}' -n {{ max_journal_lines }} --no-pager"
+    register: svc_journal_recent
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  - name: "Collect full journalctl last 500 lines for sshd"
+    ansible.builtin.command:
+      cmd: "journalctl -u {{ service_name }} -n 500 --no-pager"
+    register: svc_journal_500
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  # 3. 检查 sshd_config 配置文件语法和有效性
+  - name: "Check sshd configuration syntax (sshd -t)"
+    ansible.builtin.command:
+      cmd: "/usr/sbin/sshd -t"
+    register: sshd_syntax_check
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  - name: "Dump effective sshd configuration (sshd -T)"
+    ansible.builtin.command:
+      cmd: "/usr/sbin/sshd -T"
+    register: sshd_parsed_config
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  - name: "Fetch /etc/ssh/sshd_config content (slurp)"
+    ansible.builtin.slurp:
+      src: /etc/ssh/sshd_config
+    register: sshd_config_slurp
+    failed_when: false
+    tags: sshd_diagnose
+
+  # 4. 检查 sshd 依赖的 systemd 单元和网络端口监听
+  - name: "List systemd unit dependencies of sshd"
+    ansible.builtin.command:
+      cmd: "systemctl list-dependencies --reverse --plain {{ service_name }}"
+    register: svc_dependencies
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  - name: "Check sshd listening sockets (ss)"
+    ansible.builtin.command:
+      cmd: "ss -ltnp | grep -E 'sshd|:22\\b' || true"
+    register: listening_check
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  - name: "Get firewall-cmd active zones and allowed services (if available)"
+    ansible.builtin.command:
+      cmd: "firewall-cmd --list-all-zones"
+    register: fw_zones
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  - name: "Get SELinux status"
+    ansible.builtin.command:
+      cmd: "getenforce"
+    register: selinux_status
+    changed_when: false
+    failed_when: false
+    tags: sshd_diagnose
+
+  # 生成诊断临时文件到本地 output_dir
+  - name: "Compose local diagnostic bundle file (system + logs + config summary)"
+    ansible.builtin.copy:
+      dest: "{{ output_dir }}/{{ report_name }}"
+      content: |
+        ==== SSHD DIAGNOSTIC REPORT ====
+        Host: {{ diag_meta.host }}
+        Service: {{ diag_meta.service }}
+        Run At: {{ diag_meta.run_at }}
+
+        ---- Service Active State ----
+        {{ svc_active_raw.stdout | default('N/A') }}
+
+        ---- systemctl status ----
+        {{ svc_status.stdout | default('') }}
+
+        ---- Recent journalctl (since {{ journal_since }}) ----
+        {{ svc_journal_recent.stdout | default('') }}
+
+        ---- Last 500 journal lines ----
+        {{ svc_journal_500.stdout | default('') }}
+
+        ---- sshd config syntax check (sshd -t) ----
+        rc: {{ sshd_syntax_check.rc | default('N/A') }}
+        stdout:
+        {{ sshd_syntax_check.stdout | default('') }}
+        stderr:
+        {{ sshd_syntax_check.stderr | default('') }}
+
+        ---- sshd effective config (sshd -T) ----
+        {{ sshd_parsed_config.stdout | default('') }}
+
+        ---- /etc/ssh/sshd_config (base64 decoded) ----
+        {% if sshd_config_slurp is defined and sshd_config_slurp.content is defined %}
+        {{ sshd_config_slurp.content | b64decode }}
+        {% else %}
+        (unable to read /etc/ssh/sshd_config)
+        {% endif %}
+
+        ---- systemd dependencies ----
+        {{ svc_dependencies.stdout | default('') }}
+
+        ---- Listening sockets ----
+        {{ listening_check.stdout | default('') }}
+
+        ---- Firewall zones ----
+        {{ fw_zones.stdout | default('') }}
+
+        ---- SELinux status ----
+        {{ selinux_status.stdout | default('') }}
+
+        ==== END OF REPORT ====
+      mode: "0644"
+    tags: sshd_diagnose
+
+  - name: "Also save raw journal to separate file"
+    ansible.builtin.copy:
+      dest: "{{ output_dir }}/journal_{{ service_name | replace('.','-') }}.log"
+      content: "{{ svc_journal_500.stdout | default('') }}"
+      mode: "0644"
+    tags: sshd_diagnose
+
+  - name: "Also save sshd parsed config to file"
+    ansible.builtin.copy:
+      dest: "{{ output_dir }}/sshd_effective_config.txt"
+      content: "{{ sshd_parsed_config.stdout | default('') }}"
+      mode: "0644"
+    tags: sshd_diagnose
+
+  - name: "Also save raw sshd_config to file (decoded)"
+    ansible.builtin.copy:
+      dest: "{{ output_dir }}/sshd_config.txt"
+      content: |
+        {% if sshd_config_slurp is defined and sshd_config_slurp.content is defined %}
+        {{ sshd_config_slurp.content | b64decode }}
+        {% else %}
+        (unable to read /etc/ssh/sshd_config)
+        {% endif %}
+      mode: "0644"
+    tags: sshd_diagnose
+
+  # 传输到 Diagnose Server 前的准备：确保 known_hosts 包含诊断服务器 hostkey（在源主机上）
+  - name: "Ensure diagnose server host key is in known_hosts (source host)"
+    ansible.builtin.known_hosts:
+      name: "{{ diagnose_server }}"
+      key: "{{ lookup('pipe', 'ssh-keyscan -T 5 -H ' ~ diagnose_server) }}"
+      path: "/root/.ssh/known_hosts"
+    tags: sshd_diagnose
+
+  - name: "Verify local output directory exists before transfer"
+    ansible.builtin.stat:
+      path: "{{ output_dir }}"
+    register: source_dir_check
+    tags: sshd_diagnose
+
+  - name: "List files to transfer"
+    ansible.builtin.find:
+      paths: "{{ output_dir }}"
+      patterns: "*"
+      recurse: yes
+    register: source_files
+    tags: sshd_diagnose
+
+  - name: "Debug - files to transfer"
+    ansible.builtin.debug:
+      msg: |
+        Files in {{ output_dir }}:
+        {% for f in source_files.files | default([]) %}
+        - {{ f.path }} ({{ f.size | default(0) }} bytes)
+        {% endfor %}
+    tags: sshd_diagnose
+
+  # 在 Diagnose Server 上创建目标目录（delegate_to diagnose_server）
+  - name: "Create diagnose directory on Diagnose Server"
+    ansible.builtin.file:
+      path: "{{ diagnose_path }}"
+      state: directory
+      mode: "0755"
+      owner: root
+      group: root
+    delegate_to: "{{ diagnose_server }}"
+    register: diagnose_dir_result
+    ignore_errors: yes
+    tags: sshd_diagnose
+
+  - name: "Verify diagnose directory exists on Diagnose Server"
+    ansible.builtin.stat:
+      path: "{{ diagnose_path }}"
+    delegate_to: "{{ diagnose_server }}"
+    register: diagnose_dir_check
+    ignore_errors: yes
+    tags: sshd_diagnose
+
+  - name: "Transfer collected files to Diagnose Server using synchronize (push)"
+    ansible.posix.synchronize:
+      src: "{{ output_dir }}/"
+      dest: "root@{{ diagnose_server }}:{{ diagnose_path }}/"
+      recursive: yes
+      mode: push
+    delegate_to: "{{ inventory_hostname }}"
+    register: sync_result
+    ignore_errors: yes
+    when: source_dir_check.stat.exists and source_dir_check.stat.isdir
+    tags: sshd_diagnose
+
+  - name: "Debug - synchronize result"
+    ansible.builtin.debug:
+      msg: |
+        Sync result:
+        rc: {{ sync_result.rc | default('N/A') }}
+        stdout: {{ sync_result.stdout | default('') }}
+        stderr: {{ sync_result.stderr | default('') }}
+    tags: sshd_diagnose
+
+  # 将可能存在的最新 alert_info 文件一并传输（/tmp/<inventory_hostname>-*-alert_info.txt）
+  - name: "Find alert info files for this host in /tmp"
+    ansible.builtin.find:
+      paths: "/tmp"
+      patterns: "{{ alert_file_pattern }}"
+      recurse: false
+    register: alert_files
+    tags: sshd_diagnose
+
+  - name: "Set latest_alert_file fact (by mtime)"
+    ansible.builtin.set_fact:
+      latest_alert_file: "{{ alert_files.files | sort(attribute='mtime') | last }}"
+    when: alert_files.files | length > 0
+    tags: sshd_diagnose
+
+  - name: "Transfer latest alert file to Diagnose Server (if exists)"
+    ansible.posix.synchronize:
+      src: "{{ latest_alert_file.path }}"
+      dest: "root@{{ diagnose_server }}:{{ diagnose_path }}/"
+      mode: push
+    delegate_to: "{{ inventory_hostname }}"
+    register: alert_transfer_result
+    ignore_errors: yes
+    when: latest_alert_file is defined
+    tags: sshd_diagnose
+
+  - name: "Debug - alert transfer result"
+    ansible.builtin.debug:
+      msg: |
+        Alert transfer result:
+        rc: {{ alert_transfer_result.rc | default('N/A') }}
+        stdout: {{ alert_transfer_result.stdout | default('') }}
+        stderr: {{ alert_transfer_result.stderr | default('') }}
+        transferred: {{ latest_alert_file.path | default('N/A') }}
+    when: latest_alert_file is defined
+    tags: sshd_diagnose
+
+  # 在 Diagnose Server 上合并目录下所有文件为 issues_latest.txt，要求 alert_info 内容在最前面
+  - name: "Merge all files into issues_latest.txt on Diagnose Server"
+    ansible.builtin.shell: |
+      cd {{ diagnose_path }}
+      ALERT_FILE="{{ latest_alert_file.path | basename | default('') }}"
+
+      if [ -n "$ALERT_FILE" ] && [ -f "$ALERT_FILE" ]; then
+        echo "=== ALERT INFO ===" > issues_latest.txt
+        cat "$ALERT_FILE" >> issues_latest.txt
+        echo "" >> issues_latest.txt
+        echo "=== OTHER DIAGNOSTIC FILES ===" >> issues_latest.txt
+        echo "" >> issues_latest.txt
+      else
+        echo "=== DIAGNOSTIC FILES ===" > issues_latest.txt
+        echo "" >> issues_latest.txt
+      fi
+
+      find . -maxdepth 1 -type f \( -name "*.txt" -o -name "*.log" -o -name "*.data" \) \
+        ! -name "issues_latest.txt" ! -name "$ALERT_FILE" -print0 |
+      while IFS= read -r -d '' file; do
+        echo "=== ${file#./} ===" >> issues_latest.txt
+        cat "$file" >> issues_latest.txt
+        echo "" >> issues_latest.txt
+        echo "" >> issues_latest.txt
+      done
+
+      echo "Files merged into issues_latest.txt: $ALERT_FILE"
+    args:
+      executable: /bin/bash
+    delegate_to: "{{ diagnose_server }}"
+    register: merge_result
+    ignore_errors: yes
+    tags: sshd_diagnose
+
+  - name: "Debug - merge result"
+    ansible.builtin.debug:
+      msg: |
+        Merge result rc: {{ merge_result.rc | default('N/A') }}
+        stdout: {{ merge_result.stdout | default('') }}
+        stderr: {{ merge_result.stderr | default('') }}
+        merged_file: {{ diagnose_path }}/issues_latest.txt
+    tags: sshd_diagnose
+
+  - name: "Verify merged issues_latest.txt exists on Diagnose Server"
+    ansible.builtin.stat:
+      path: "{{ diagnose_path }}/issues_latest.txt"
+    delegate_to: "{{ diagnose_server }}"
+    register: merged_file_stat
+    ignore_errors: yes
+    tags: sshd_diagnose
+
+  - name: "Final debug - report location"
+    ansible.builtin.debug:
+      msg: |
+        Diagnostic bundle transferred to Diagnose Server:
+        - Diagnose server: {{ diagnose_server }}
+        - Diagnose directory: {{ diagnose_path }}
+        - issues_latest.txt exists: {{ merged_file_stat.stat.exists | default(false) }}
+    tags: sshd_diagnose
